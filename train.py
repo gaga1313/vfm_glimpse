@@ -4,9 +4,10 @@ import numpy as np
 import sys
 
 import matplotlib.pyplot as plt
-from tensorflow.keras.layers import Layer
-from tensorflow import keras
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
 import argparse
 import pickle
 
@@ -30,7 +31,6 @@ EPOCHS = args.epochs
 EVAL = args.eval
 
 
-
 if not os.path.exists('./models/{}/'.format(OUTDIR)):
 	os.mkdir('./models/{}/'.format(OUTDIR))
 
@@ -44,15 +44,14 @@ else:
 
 
 if DATASET=='mnist':
-	tr_ds, vd_ds, ts_ds = load_mnist(CFG)
+	tr_dl, vd_dl, ts_dl = load_mnist(CFG)
 elif DATASET=='fashion':
-	tr_ds, vd_ds, ts_ds = load_fashion(CFG)
+	tr_dl, vd_dl, ts_dl = load_fashion(CFG)
 elif DATASET=='omni':
-	tr_ds, vd_ds, ts_ds = load_omni(CFG)
+	tr_dl, vd_dl, ts_dl = load_omni(CFG)
 elif DATASET=='affnist':
-	tr_ds, vd_ds, ts_ds = load_affnist(CFG)
+	tr_dl, vd_dl, ts_dl = load_affnist(CFG)
 	
-
 
 fh = open('./models/{}/'.format(OUTDIR)+'config.pkl','wb')
 pickle.dump(CFG,fh)
@@ -61,57 +60,85 @@ fh.close()
 BATCH_SIZE = CFG.BATCH_SIZE
 H,W,C = CFG.dims
 
-
-
+# Create PyTorch model
 model = APC(CFG)
 
-model.build([(CFG.BATCH_SIZE, H, W, C),(CFG.BATCH_SIZE,)])
-print(model.summary())
+# Move model to GPU if available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+
+# Print model summary (PyTorch equivalent)
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Model Summary:")
+print(f"Total parameters: {total_params:,}")
+print(f"Trainable parameters: {trainable_params:,}")
 
 if LOAD:
-	model.load_weights('./models/{}/model/weights'.format(OUTDIR)).expect_partial()
+	model.load_state_dict(torch.load('./models/{}/model/weights.pth'.format(OUTDIR), map_location=device))
 
-loss = tf.keras.losses.MeanSquaredError()
-metrics = [tf.keras.metrics.MeanSquaredError()]
+# Training function
+def train_epoch(model, dataloader, device):
+    model.train()
+    total_loss = 0.0
+    for batch_idx, (data, target) in enumerate(dataloader):
+        data, target = data.to(device), target.to(device)
+        
+        # The APC model expects (images, labels) as input
+        inputs = (data, target)
+        
+        # Use the model's train_step method
+        result = model.train_step(inputs)
+        total_loss += result['loss']
+    
+    return total_loss / len(dataloader)
 
-model.compile(
-	optimizer=keras.optimizers.Adam(CFG.lr),
-	loss=loss,
-	metrics=metrics#, run_eagerly=True
-)
-
+# Evaluation function
+def evaluate(model, dataloader, device):
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for data, target in dataloader:
+            data, target = data.to(device), target.to(device)
+            
+            # The APC model expects (images, labels) as input
+            inputs = (data, target)
+            
+            # Use the model's test_step method
+            result = model.test_step(inputs)
+            # For evaluation, we might want to compute MSE loss
+            pred = result['pred']
+            mse_loss = torch.mean((pred - data) ** 2)
+            total_loss += mse_loss.item()
+    
+    return total_loss / len(dataloader)
 
 if EVAL:
-	
 	model.std1 = 0.0
 	model.std2 = 0.0
 	
-	x = 0.0
-	for i in range(10):
-		x += model.evaluate(ts_ds)/10
-	print(x)
+	# Evaluate on test set
+	test_loss = evaluate(model, ts_dl, device)
+	print(f"Test Loss: {test_loss:.6f}")
 	exit()
 	
 else:
-
-	model.fit(
-		tr_ds,
-		validation_data = vd_ds,
-		validation_freq = 50,
-		epochs = EPOCHS,
-		verbose = 1
-	)
+	# Training loop
+	for epoch in range(EPOCHS):
+		train_loss = train_epoch(model, tr_dl, device)
+		
+		# Validation every 50 epochs
+		if (epoch + 1) % 50 == 0:
+			val_loss = evaluate(model, vd_dl, device)
+			print(f'Epoch [{epoch+1}/{EPOCHS}], Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}')
+		else:
+			print(f'Epoch [{epoch+1}/{EPOCHS}], Train Loss: {train_loss:.6f}')
 	
-	model.save_weights('./models/{}/model/weights'.format(OUTDIR))
-	model.evaluate(ts_ds)
-
-
-
-
-
-
-
-
-
-
-
+	# Save model weights
+	if not os.path.exists('./models/{}/model/'.format(OUTDIR)):
+		os.makedirs('./models/{}/model/'.format(OUTDIR))
+	torch.save(model.state_dict(), './models/{}/model/weights.pth'.format(OUTDIR))
+	
+	# Final evaluation on test set
+	test_loss = evaluate(model, ts_dl, device)
+	print(f"Final Test Loss: {test_loss:.6f}")
